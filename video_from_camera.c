@@ -14,8 +14,7 @@
 
 #define PATH	"/dev/video0"
 //#define PATH	"/dev/usb/hiddev0"
-#define FIFO_COUNT	8
-#define FIFO_LENGTH	15000
+
 struct mmap_buffer{
 	void *ptr;
 	int length;
@@ -25,10 +24,12 @@ struct buffer{
 	void *addr;		
 };
 struct fifo_buffer{
-	char r_index;
-	char w_index;
-	char count;
-	struct buffer *buf;
+	int r_index;
+	int w_index;
+	int size;
+	int free;
+	void *addr;
+	int lock;
 };
 struct camera_info{
 	struct mmap_buffer *mmap_buf;	
@@ -128,17 +129,16 @@ int get_v4l2_requestbuffers(int fd, int buf_count)
 	}
 }
 
-int get_v4l2_buffer(const int fd, int count, struct camera_info *ca_info)
+int mmap_v4l2_buffer(const int fd, int count, struct camera_info *ca_info)
 {
-	int ret = -1, i = 0;
+	int ret = -1, i = 0, buf_size = 0;
 	struct v4l2_buffer buf;
 	void *ptr = NULL;
 
 	if(count < 1)
 			return -1;
 	ca_info->mmap_buf = (struct mmap_buffer *)malloc(count*sizeof(struct mmap_buffer));
-	ca_info->fifo_buf.count = count;
-	ca_info->fifo_buf.buf = (struct buffer *)malloc(ca_info->fifo_buf.count*sizeof(struct buffer));
+	
 	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	buf.memory = V4L2_MEMORY_MMAP;
 	for(i = 0; i < count; i++)
@@ -146,7 +146,6 @@ int get_v4l2_buffer(const int fd, int count, struct camera_info *ca_info)
 		buf.index = i;
 		ret = ioctl(fd, VIDIOC_QUERYBUF, &buf);
 		printf("%d:%s i=%d buf.length=%d\n", __LINE__, __func__, i, buf.length);
-	//	printf("%d:%s i=%d buf.m.offset=%d\n", __LINE__, __func__, i, buf.m.offset);
 		if(ret < 0)
 		{
 			printf("%d:%s i=%d ioctl fail\n", __LINE__, __func__, i);
@@ -160,11 +159,20 @@ int get_v4l2_buffer(const int fd, int count, struct camera_info *ca_info)
 		}
 		(ca_info->mmap_buf + i)->ptr = ptr;
 		(ca_info->mmap_buf + i)->length = buf.length;
-		(ca_info->fifo_buf.buf + i)->length = buf.length;
-		(ca_info->fifo_buf.buf + i)->addr = (void *)malloc((ca_info->fifo_buf.buf + i)->length);
+		buf_size += buf.length;
 		printf("%d:%s ptr=%p\n", __LINE__, __func__, ptr);
+		printf("%d:%s buf_size=%d\n", __LINE__, __func__, buf_size);
 		ptr = NULL;
 	}
+	printf("%d:%s buf_size=%d\n", __LINE__, __func__, buf_size);
+
+	ca_info->fifo_buf.size = ((buf_size + (1 << 12))/(1 << 12))*(1 << 12);
+	ca_info->fifo_buf.free = ca_info->fifo_buf.size;
+	ca_info->fifo_buf.r_index = ca_info->fifo_buf.w_index = 0;
+	ca_info->fifo_buf.addr = (char *)malloc(ca_info->fifo_buf.size);
+	printf("%d:%s ca_info->fifo_buf.size=%d\n", __LINE__, __func__, ca_info->fifo_buf.size);
+	printf("%d:%s ca_info->fifo_buf.free=%d\n", __LINE__, __func__, ca_info->fifo_buf.free);
+	
 	if(ret < 0)
 	{
 		printf("%d:%s fail\n", __LINE__, __func__);
@@ -198,10 +206,82 @@ int v4l2_buffer_VIDIOC_QBUF(int fd, int index)
 	return ret;
 }
 
+int push_data_to_fifo_buffer(struct fifo_buffer *dst, const struct mmap_buffer *src, const index)
+{
+	if((NULL == dst) && (NULL== src))
+	{
+		return -1;
+	}
+
+	//src->lock 
+	if(dst->free >= (src + index)->length)
+	{
+		if((dst->r_index <= dst->w_index) && ((dst->size - dst->w_index) < (src + index)->length))
+		{
+			printf("%d:%s\n", __LINE__, __func__);
+			unsigned char *temp = (char *)malloc((src + index)->length);
+			if(temp == NULL)
+			{
+				printf("%d:%s malloc temp failed\n", __LINE__, __func__);
+			}
+			memcpy(temp, (unsigned char *)((src + index)->ptr), (src + index)->length);
+			memcpy((unsigned char *)dst->addr + dst->w_index, temp, dst->size - dst->w_index);
+			memcpy((unsigned char *)dst->addr, temp + (dst->size - dst->w_index), (src + index)->length - (dst->size - dst->w_index));
+			free(temp);
+		}else
+		{
+			memcpy((unsigned char *)dst->addr + dst->w_index, (unsigned char *)((src + index)->ptr), (src + index)->length);
+		}
+		dst->w_index += (src + index)->length;
+		dst->w_index %= dst->size;
+		dst->free -= (src + index)->length;
+	
+		//printf("%d:%s dst->free=%d\n", __LINE__, __func__, dst->free);
+		//printf("%d:%s (src + index)->length=%d\n", __LINE__, __func__, (src + index)->length);
+		//printf("%d:%s dst->w_index=%d\n", __LINE__, __func__, dst->w_index);
+		//printf("%d:%s dst->r_index=%d\n", __LINE__, __func__, dst->r_index);		
+	}
+
+	
+	//src->lock 
+	return (src + index)->length;
+}
+
+int pop_data_from_fifo_buffer(void *dst, struct fifo_buffer * const src, const int count)
+{
+	if((NULL == dst) && (NULL== src))
+	{
+		return -1;
+	}
+
+	//src->lock 
+	if((src->size - src->free) >= count)
+	{
+		if((src->w_index <= src->r_index) && (src->size - src->r_index) < count)
+		{
+			memcpy((unsigned char *)dst, (unsigned char *)src->addr + src->r_index, src->size - src->r_index);
+			memcpy((unsigned char *)dst + (src->size - src->r_index), (unsigned char *)src->addr, count - (src->size - src->r_index));
+		}else
+		{
+			memcpy((unsigned char *)dst, (unsigned char *)src->addr + src->r_index, count);
+		}
+		src->r_index += count;
+		src->r_index %= src->size;
+		src->free += count;
+	}
+	
+	//src->lock 
+	//printf("%d:%s src->free=%d\n", __LINE__, __func__, src->free);
+	//printf("%d:%s src->w_index=%d\n", __LINE__, __func__, src->w_index);
+	//printf("%d:%s src->r_index=%d\n", __LINE__, __func__, src->r_index);
+	return count;
+}
+
 int v4l2_buffer_VIDIOC_DQBUF_QBUF(int fd, struct camera_info *ca_info)
 {
 	struct v4l2_buffer buf;
-	int ret = -1;
+	int ret = -1; 
+	unsigned char i;
 	//lock
 	memset(&buf, 0, sizeof(buf));
 	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -218,14 +298,9 @@ int v4l2_buffer_VIDIOC_DQBUF_QBUF(int fd, struct camera_info *ca_info)
 
 //	printf("%d:%s ca_info->fifo_buf.w_index=%d\n", __LINE__, __func__, ca_info->fifo_buf.w_index);
 //	printf("%d:%s ca_info->mmap_buf->length=%d\n", __LINE__, __func__, ca_info->mmap_buf->length);
-	
-	if(((ca_info->fifo_buf.w_index+1)%ca_info->fifo_buf.count) != ca_info->fifo_buf.r_index)
-	{
-		memcpy((char *)((ca_info->fifo_buf.buf + ca_info->fifo_buf.w_index)->addr), (char *)((ca_info->mmap_buf+buf.index)->ptr), (ca_info->fifo_buf.buf + ca_info->fifo_buf.w_index)->length);
-		ca_info->fifo_buf.w_index++;
-		ca_info->fifo_buf.w_index %= ca_info->fifo_buf.count;
-		printf("%d:%s memcpy\n", __LINE__, __func__);
-	}
+
+	push_data_to_fifo_buffer(&ca_info->fifo_buf, ca_info->mmap_buf, buf.index);
+
 	ret = ioctl(fd, VIDIOC_QBUF, &buf);
 	if(ret < 0)
 	{
@@ -304,14 +379,11 @@ void init_param(int fd)
 {
 	int ret = -1, index;
 	memset(&camera, 0, sizeof(camera));
-	camera.mmap_buf = NULL;
-	camera.fifo_buf.r_index = 0;
-	camera.fifo_buf.w_index = 0;
 	
 	set_v4l2_format(fd);
 	set_frame_fp(fd, 30);
 	ret = get_v4l2_requestbuffers(fd, 4);
-	get_v4l2_buffer(fd, ret, &camera);
+	mmap_v4l2_buffer(fd, ret, &camera);
 	get_v4l2_capability(fd);
 	for(index = 0; index < ret; index++)
 	{
@@ -339,6 +411,7 @@ void start_capture_data(int fd)
 		exit(EXIT_FAILURE);
 	}
 
+	unsigned char temp_buf[50000], i;
 	for(;;)
 	{
 		nfds = epoll_wait(epollfd, events, 10, 1000);
@@ -349,6 +422,16 @@ void start_capture_data(int fd)
 		}
 		printf("nfds = %d\n", nfds);
 		v4l2_buffer_VIDIOC_DQBUF_QBUF(fd, &camera);
+		pop_data_from_fifo_buffer(temp_buf, &camera.fifo_buf, 50000);
+
+		write_file("chenwenmin", temp_buf, 50000);
+		#if 0
+		for(i = 0; i < 256; i++)
+		{
+			printf("temp_buf[%d] = %d\n", i, temp_buf[i]);
+		}
+		#endif
+		
 		//v4l2_buffer_VIDIOC_QBUF(fd, index);
 	}
 }

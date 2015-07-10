@@ -1,5 +1,5 @@
 CROSS_COMPILE?=
-OBJC:=video_from_camera.c main.c
+OBJC:=video_file.c video_from_camera.c main.c
 LDS:=
 TARGET:=target
 
