@@ -10,10 +10,13 @@
 #include <sys/epoll.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 
 #define PATH	"/dev/video0"
 //#define PATH	"/dev/usb/hiddev0"
+#define PIX_WIDTH	640
+#define PIX_HEIGHT	480
 
 struct mmap_buffer{
 	void *ptr;
@@ -53,6 +56,14 @@ void get_v4l2_capability(int fd)
 		printf("driver=%s, card=%s bus_info=%s, version=%d, capabilities=%d, device_caps=%d, reserver=%s\n", cap.driver, cap.card, cap.bus_info, cap.version, cap.capabilities, cap.device_caps, "cap.reserver");
 	}
 
+	if(!(cap.capabilities & V4L2_BUF_TYPE_VIDEO_CAPTURE))
+	{
+		printf("%d: %s The Current device is not a video capture device\n", __LINE__, __func__);	
+	}
+	if(!(cap.capabilities & V4L2_CAP_STREAMING))
+	{
+		printf("%d: %s The Current device does not support streaming i/o\n", __LINE__, __func__);	
+	}
 }
 
 void get_v4l2_fmtdesc(int fd)
@@ -76,6 +87,35 @@ void get_v4l2_format(int fd)
 	ret = ioctl(fd, VIDIOC_G_FMT, &format);
 	if(ret < 0)
 			printf("%d:%s fail\n", __LINE__, __func__);
+
+	switch(format.fmt.pix.pixelformat)
+	{
+		case V4L2_PIX_FMT_YVU410:
+			printf("%d:%s \n", __LINE__, __func__);
+				break;
+
+		case V4L2_PIX_FMT_YVU420:
+			printf("%d:%s V4L2_PIX_FMT_YVU420\n", __LINE__, __func__);
+				break;
+
+		case V4L2_PIX_FMT_YUYV:
+			printf("%d:%s V4L2_PIX_FMT_YUYV\n", __LINE__, __func__);
+				break;
+
+		case V4L2_PIX_FMT_YUV422P:
+			printf("%d:%s V4L2_PIX_FMT_YUV422P\n", __LINE__, __func__);
+				break;
+
+		case V4L2_PIX_FMT_YUV420:
+			printf("%d:%s V4L2_PIX_FMT_YUV420\n", __LINE__, __func__);
+				break;
+
+		default:
+				break;
+	}
+	
+	printf("%d:%s format.fmt.pix.width=%d\n", __LINE__, __func__, format.fmt.pix.width);
+	printf("%d:%s format.fmt.pix.height=%d\n", __LINE__, __func__, format.fmt.pix.height);
 }
 
 void set_v4l2_format(int fd)
@@ -84,9 +124,10 @@ void set_v4l2_format(int fd)
 	struct v4l2_format format;
 	memset(&format, 0, sizeof(struct v4l2_format));
 	format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	format.fmt.pix.width = 640;
-	format.fmt.pix.height = 480;
-	format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	format.fmt.pix.width = PIX_WIDTH;
+	format.fmt.pix.height = PIX_HEIGHT;
+	format.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;//V4L2_PIX_FMT_YUV420 V4L2_PIX_FMT_YUV422P
+	//format.fmt.pix.priv = V4L2_FMT_OUT;
 	format.fmt.pix.field = V4L2_FIELD_INTERLACED;
 	
 	ret = ioctl(fd, VIDIOC_S_FMT, &format);
@@ -94,25 +135,45 @@ void set_v4l2_format(int fd)
 			printf("%d:%s fail\n", __LINE__, __func__);
 }
 
-set_frame_fp(int fd, int fps)
+int set_frame_fp(int fd, int fps)
 {
 	struct v4l2_streamparm parm;
 	memset(&parm, 0, sizeof(struct v4l2_streamparm));
 	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	parm.parm.capture.capturemode = V4L2_MODE_HIGHQUALITY;
+	parm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	parm.parm.capture.timeperframe.numerator = 1;
 	parm.parm.capture.timeperframe.denominator = fps;
 	if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
 		printf("%d:%s fail\n", __LINE__, __func__);
-	return 0;
+	return -1;
 	}
 
 	return 1;
+}
+
+int get_frame_fp(int fd)
+{
+	struct v4l2_streamparm parm;
+	memset(&parm, 0, sizeof(struct v4l2_streamparm));
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	
+	if (ioctl(fd, VIDIOC_G_PARM, &parm) < 0) {
+		printf("%d:%s fail\n", __LINE__, __func__);
+	return -1;
+	}
+
+	printf("%d:%s parm.parm.capture.timeperframe.numerator=%d\n", __LINE__, __func__, parm.parm.capture.timeperframe.numerator);
+	printf("%d:%s parm.parm.capture.timeperframe.denominator=%d\n", __LINE__, __func__, parm.parm.capture.timeperframe.denominator);
+	return 0;
 }
 
 int get_v4l2_requestbuffers(int fd, int buf_count)
 {
 	int ret = -1;
 	struct v4l2_requestbuffers reqbuf;
+
+	bzero(&reqbuf, sizeof(struct v4l2_requestbuffers));
 	reqbuf.count = buf_count;
 	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	reqbuf.memory = V4L2_MEMORY_MMAP;
@@ -132,18 +193,21 @@ int get_v4l2_requestbuffers(int fd, int buf_count)
 int mmap_v4l2_buffer(const int fd, int count, struct camera_info *ca_info)
 {
 	int ret = -1, i = 0, buf_size = 0;
-	struct v4l2_buffer buf;
 	void *ptr = NULL;
 
 	if(count < 1)
 			return -1;
 	ca_info->mmap_buf = (struct mmap_buffer *)malloc(count*sizeof(struct mmap_buffer));
 	
-	buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf.memory = V4L2_MEMORY_MMAP;
 	for(i = 0; i < count; i++)
 	{
+		struct v4l2_buffer buf;
+		
+		bzero(&buf, sizeof(struct v4l2_buffer));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
 		buf.index = i;
+
 		ret = ioctl(fd, VIDIOC_QUERYBUF, &buf);
 		printf("%d:%s i=%d buf.length=%d\n", __LINE__, __func__, i, buf.length);
 		if(ret < 0)
@@ -219,7 +283,7 @@ int push_data_to_fifo_buffer(struct fifo_buffer *dst, const struct mmap_buffer *
 		if((dst->r_index <= dst->w_index) && ((dst->size - dst->w_index) < (src + index)->length))
 		{
 			printf("%d:%s\n", __LINE__, __func__);
-			unsigned char *temp = (char *)malloc((src + index)->length);
+			unsigned char *temp = (unsigned char *)malloc((src + index)->length);
 			if(temp == NULL)
 			{
 				printf("%d:%s malloc temp failed\n", __LINE__, __func__);
@@ -352,7 +416,7 @@ void set_v4l2_framebuffer(int fd)
 int open_camera(void)
 {
 	int fd = -1, ret = -1, index;
-	fd = open(PATH, O_RDWR);
+	fd = open(PATH, O_RDWR | O_NONBLOCK);
 
 	printf("fd = %d\n", fd);
 	if(fd > 0)
@@ -380,11 +444,13 @@ void init_param(int fd)
 	int ret = -1, index;
 	memset(&camera, 0, sizeof(camera));
 	
+	get_v4l2_capability(fd);
 	set_v4l2_format(fd);
 	set_frame_fp(fd, 30);
+	get_v4l2_format(fd);
+	get_frame_fp(fd);
 	ret = get_v4l2_requestbuffers(fd, 4);
 	mmap_v4l2_buffer(fd, ret, &camera);
-	get_v4l2_capability(fd);
 	for(index = 0; index < ret; index++)
 	{
 		v4l2_buffer_VIDIOC_QBUF(fd, index);
@@ -424,7 +490,7 @@ void start_capture_data(int fd)
 		v4l2_buffer_VIDIOC_DQBUF_QBUF(fd, &camera);
 		pop_data_from_fifo_buffer(temp_buf, &camera.fifo_buf, 50000);
 
-		write_file("chenwenmin", temp_buf, 50000);
+		write_file("chenwenmin.yuv", temp_buf, 50000);
 		#if 0
 		for(i = 0; i < 256; i++)
 		{
